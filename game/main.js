@@ -1802,6 +1802,47 @@ function stageShot(name) {
     }
     orderBoard.update(0, kitchen);
     showMessage('Kiko siap memasak!');
+  } else if (name === 'plating') {
+    game.screen = SCREEN.PLAY;
+    game.kiko.x = 760;
+    game.kiko.y = 500;
+    game.served = 1;
+    game.coins = 20;
+    game.combo = 2;
+    game.streak = 1;
+    game.shiftTime = 150;
+    orderBoard.stage(['sandwich', 'omelet', 'burger'], [45, 52, 66], [58, 62, 72]);
+    kitchen.plate = [makeItem('roti'), makeItem('keju')];
+    kitchen.carried = makeItem('selada');
+    kitchen.carried.chopped = true;
+    orderBoard.update(0, kitchen);
+    showMessage('Tata selada di piring untuk Sandwich Keju!');
+  } else if (name === 'cook') {
+    game.screen = SCREEN.PLAY;
+    game.kiko.x = 415;
+    game.kiko.y = 430;
+    game.served = 2;
+    game.coins = 40;
+    game.combo = 2;
+    game.streak = 2;
+    game.shiftTime = 96;
+    orderBoard.stage(['burger', 'omelet', 'sandwich'], [6, 34, 58], [58, 62, 72]);
+    kitchen.plate = [makeItem('roti')];
+    const stove = STATIONS.find((station) => station.id === 'stove1');
+    const chop = STATIONS.find((station) => station.id === 'chop1');
+    if (stove) {
+      stove.item = makeItem('daging');
+      stove.item.chopped = true;
+      stove.progress = 0.64;
+      stove.working = true;
+    }
+    if (chop) {
+      chop.item = makeItem('tomat');
+      chop.progress = 0.58;
+      chop.working = true;
+    }
+    orderBoard.update(0, kitchen);
+    showMessage('Ayo cepat! Tiket Burger Ceria hampir habis!');
   } else if (name === 'end') {
     game.screen = SCREEN.END;
     game.served = 7;
