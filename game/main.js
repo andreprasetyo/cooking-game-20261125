@@ -13,6 +13,7 @@ import {
   itemReady,
 } from './kitchen.js';
 import { OrderBoard, CUSTOMERS } from './orders.js';
+import { sound } from './sound.js';
 
 const WIDTH = 1280;
 const HEIGHT = 720;
@@ -217,6 +218,7 @@ const game = {
   coins: 0,
   combo: 1,
   streak: 0,
+  tutorialTime: 0,
   shiftTime: SHIFT_LENGTH,
   shiftLength: SHIFT_LENGTH,
   target: SHIFT_TARGET,
@@ -1346,12 +1348,53 @@ function drawScreens(now) {
 // Loop dan aturan permainan
 // ---------------------------------------------------------------------------
 
+// Strip tutorial 5 langkah di awal permainan.
+const TUTORIAL_STEPS = [
+  { label: '1 PANTRY', sub: 'Ambil bahan', icon: 'roti' },
+  { label: '2 CHOP', sub: 'Potong', icon: 'tomat' },
+  { label: '3 STOVE', sub: 'Masak', icon: 'telur' },
+  { label: '4 PLATING', sub: 'Tata di piring', icon: 'keju' },
+  { label: '5 SERVE', sub: 'Antar & sajikan', icon: 'daging' },
+];
+
+function drawTutorialStrip() {
+  const w = 1040;
+  const h = 84;
+  const x = (WIDTH - w) / 2;
+  const y = HEIGHT - h - 12;
+  ctx.save();
+  ctx.fillStyle = 'rgba(255, 251, 235, 0.95)';
+  ctx.fillRect(x, y, w, h);
+  ctx.strokeStyle = '#7a4a21';
+  ctx.lineWidth = 3;
+  ctx.strokeRect(x, y, w, h);
+  const cell = w / TUTORIAL_STEPS.length;
+  TUTORIAL_STEPS.forEach((step, i) => {
+    const cx = x + cell * i + cell / 2;
+    drawIngredient(step.icon, cx, y + 24, 32);
+    ctx.fillStyle = '#3a2412';
+    ctx.font = 'bold 17px system-ui, sans-serif';
+    ctx.textAlign = 'center';
+    ctx.textBaseline = 'middle';
+    ctx.fillText(step.label, cx, y + 54);
+    ctx.font = '14px system-ui, sans-serif';
+    ctx.fillText(step.sub, cx, y + 72);
+    if (i < TUTORIAL_STEPS.length - 1) {
+      ctx.fillStyle = '#e07830';
+      ctx.font = 'bold 22px system-ui, sans-serif';
+      ctx.fillText('>', x + cell * (i + 1), y + 38);
+    }
+  });
+  ctx.restore();
+}
+
 function render(now = performance.now()) {
   ctx.setTransform(1, 0, 0, 1, 0, 0);
   ctx.fillStyle = COLORS.cream;
   ctx.fillRect(0, 0, WIDTH, HEIGHT);
   drawKitchen(now);
   drawScreens(now);
+  if (game.screen === SCREEN.PLAY && game.tutorialTime > 0) drawTutorialStrip();
 }
 
 function announce(message) {
@@ -1373,6 +1416,7 @@ function resetGame() {
   game.shiftTime = SHIFT_LENGTH;
   game.message = '';
   game.messageTimer = 0;
+  game.tutorialTime = 14;
   game.kiko.x = 760;
   game.kiko.y = 360;
   game.kiko.facingLeft = false;
@@ -1503,6 +1547,7 @@ function interact() {
   if (hit.type === 'ingredient') {
     const result = kitchen.takeIngredient(hit.ingredient.id);
     showMessage(result.message);
+    if (result.ok) sound.pickup();
     return;
   }
 
@@ -1527,6 +1572,7 @@ function interact() {
     }
     const result = kitchen.carried ? kitchen.addToPlate() : kitchen.pickupPlate();
     showMessage(result.message);
+    if (result.ok) sound.pickup();
     return;
   }
 
@@ -1554,18 +1600,18 @@ function serve() {
 
   const dish = kitchen.carried;
   if (!dish) {
-    showMessage('Kiko belum membawa sajian.');
+    showMessage('Kiko belum membawa sajian.'); sound.fail();
     return;
   }
 
   if (dish.kind !== 'dish') {
-    showMessage('Bahan belum jadi sajian. Tata dulu di PLATING.');
+    showMessage('Bahan belum jadi sajian. Tata dulu di PLATING.'); sound.fail();
     return;
   }
 
   const order = orderBoard.serve(dish.recipeId);
   if (!order) {
-    showMessage(`Belum ada tiket ${dish.name}. Cek papan pesanan.`);
+    showMessage(`Belum ada tiket ${dish.name}. Cek papan pesanan.`); sound.fail();
     return;
   }
 
@@ -1579,6 +1625,8 @@ function serve() {
 
   const targetText = game.coins >= game.target ? ' Target tercapai!' : '';
   showMessage(`${dish.name} untuk ${order.customer}! +$${pay} (x${multiplier}).${targetText}`);
+    sound.success();
+    if (multiplier > 1) sound.combo(multiplier);
 }
 
 function primaryAction() {
@@ -1596,8 +1644,13 @@ function update(dt) {
 
   game.elapsed += dt;
   game.shiftTime = Math.max(0, game.shiftTime - dt);
+  if (game.tutorialTime > 0) game.tutorialTime -= dt;
   kitchen.update(dt);
-  for (const event of kitchen.drainEvents()) showMessage(event.message);
+  for (const event of kitchen.drainEvents()) {
+    showMessage(event.message);
+    if (event.message.includes('dipotong')) sound.chop();
+    else if (event.message.includes('matang')) sound.cooked();
+  }
 
   orderBoard.update(dt, kitchen);
   for (const event of orderBoard.drainEvents()) {
@@ -1605,6 +1658,7 @@ function update(dt) {
       game.combo = COMBO_BREAK;
       game.streak = 0;
       showMessage(`Tiket ${event.order.customer} hangus! Combo kembali x${COMBO_BREAK}.`);
+      sound.fail();
     }
   }
 
@@ -1650,6 +1704,13 @@ window.addEventListener('keydown', (event) => {
   }
 });
 
+window.addEventListener('keydown', (event) => {
+  sound.unlock();
+  if (event.code === 'KeyM') {
+    const muted = sound.toggleMute();
+    showMessage(muted ? 'Suara mati. Tekan M untuk menyalakan lagi.' : 'Suara hidup.');
+  }
+});
 window.addEventListener('keyup', (event) => {
   keys.delete(event.code);
 });
