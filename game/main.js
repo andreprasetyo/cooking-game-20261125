@@ -1,11 +1,27 @@
-// Dapur Ceria Kiko - kerangka game memasak 2D untuk anak-anak.
+// Dapur Ceria Kiko - game memasak 2D untuk anak-anak.
 // Satu canvas 1280x720, semua gambar dilukis dengan bentuk canvas, tanpa aset atau
-// permintaan jaringan. Sesi ini menyiapkan dapur, Kiko, gerak, kamera tetap, state
-// permainan, dan kait screenshot (?shot=start|play|end serta window.__kiko).
+// permintaan jaringan. main.js mengatur render, gerak, input, skor, dan shift;
+// kitchen.js mengatur bahan, proses stasiun, piring, dan resep; orders.js mengatur
+// tiket pelanggan, timer, dan kedaluwarsa. Kait screenshot tetap ?shot=start|play|end.
+
+import {
+  INGREDIENTS,
+  INGREDIENT_BY_ID,
+  RECIPES,
+  Kitchen,
+  makeItem,
+  itemReady,
+} from './kitchen.js';
+import { OrderBoard, CUSTOMERS } from './orders.js';
 
 const WIDTH = 1280;
 const HEIGHT = 720;
 const FONT = 'system-ui, -apple-system, "Segoe UI", Roboto, Arial, sans-serif';
+const SHIFT_LENGTH = 180;
+const SHIFT_TARGET = 120;
+const MAX_COMBO = 5;
+const COMBO_BREAK = 1;
+const ORDER_LIMIT = 3;
 
 const SCREEN = Object.freeze({
   TITLE: 'judul',
@@ -38,17 +54,6 @@ const KIKO_SPEED = 270;
 const INTERACT_RADIUS = 118;
 const STATION_RADIUS = 64;
 
-const INGREDIENTS = [
-  { id: 'roti', name: 'Roti' },
-  { id: 'telur', name: 'Telur' },
-  { id: 'tomat', name: 'Tomat' },
-  { id: 'keju', name: 'Keju' },
-  { id: 'selada', name: 'Selada' },
-  { id: 'daging', name: 'Daging' },
-];
-
-const INGREDIENT_BY_ID = new Map(INGREDIENTS.map((item) => [item.id, item]));
-
 const STATIONS = [
   {
     id: 'pantry',
@@ -62,7 +67,7 @@ const STATIONS = [
     fill: '#c98a4b',
     edge: '#8b5e34',
     ink: '#3f2613',
-    solid: true,
+    solid: false,
   },
   {
     id: 'chop1',
@@ -194,6 +199,13 @@ for (let row = 0; row < 3; row += 1) {
   }
 }
 
+const params = new URLSearchParams(window.location.search);
+const seedParam = params.get('seed');
+const orderBoard = new OrderBoard({
+  seed: seedParam === null ? Date.now() % 2147483647 : Number(seedParam) || 1,
+});
+const kitchen = new Kitchen(STATIONS);
+
 const canvas = document.getElementById('game');
 const ctx = canvas.getContext('2d');
 const statusLine = document.getElementById('status');
@@ -202,7 +214,12 @@ const game = {
   screen: SCREEN.TITLE,
   elapsed: 0,
   served: 0,
-  carried: null,
+  coins: 0,
+  combo: 1,
+  streak: 0,
+  shiftTime: SHIFT_LENGTH,
+  shiftLength: SHIFT_LENGTH,
+  target: SHIFT_TARGET,
   message: '',
   messageTimer: 0,
   kiko: {
@@ -213,6 +230,15 @@ const game = {
     moving: false,
   },
 };
+
+Object.defineProperty(game, 'carried', {
+  get() {
+    return kitchen.carried;
+  },
+  set(value) {
+    kitchen.setCarried(value);
+  },
+});
 
 const keys = new Set();
 const moveKeys = new Set([
@@ -282,6 +308,46 @@ function circleHitsRect(cx, cy, radius, rect) {
 function ingredientName(id) {
   const ingredient = INGREDIENT_BY_ID.get(id);
   return ingredient ? ingredient.name : id;
+}
+
+function itemId(item) {
+  if (!item) return null;
+  return typeof item === 'string' ? item : item.id;
+}
+
+function formatClock(seconds) {
+  const safe = Math.max(0, Math.ceil(seconds));
+  const minutes = Math.floor(safe / 60);
+  const rest = safe % 60;
+  return `${minutes}:${String(rest).padStart(2, '0')}`;
+}
+
+function urgencyColor(ratio) {
+  if (ratio <= 0.25) return '#c0392b';
+  if (ratio <= 0.55) return '#d68910';
+  return '#4f8b5f';
+}
+
+function drawCheckMark(cx, cy, size, color) {
+  ctx.strokeStyle = color;
+  ctx.lineWidth = Math.max(2, size * 0.22);
+  ctx.lineCap = 'round';
+  ctx.lineJoin = 'round';
+  ctx.beginPath();
+  ctx.moveTo(cx - size * 0.45, cy);
+  ctx.lineTo(cx - size * 0.08, cy + size * 0.36);
+  ctx.lineTo(cx + size * 0.48, cy - size * 0.32);
+  ctx.stroke();
+}
+
+function itemCaption(item) {
+  if (!item) return '';
+  const id = itemId(item);
+  const ingredient = INGREDIENT_BY_ID.get(id);
+  if (!ingredient) return id;
+  if (ingredient.needsCook) return item.cooked ? `${ingredient.name} matang` : `${ingredient.name} mentah`;
+  if (ingredient.needsChop) return item.chopped ? `${ingredient.name} potong` : `${ingredient.name} utuh`;
+  return ingredient.name;
 }
 
 // ---------------------------------------------------------------------------
@@ -605,27 +671,117 @@ function drawWalls() {
   ctx.fillRect(0, HEIGHT - 8, WIDTH, 8);
 }
 
-function drawOrderBoard() {
+function drawTicket(order, x, y, w, h, now) {
+  const ratio = clamp(order.timeLeft / order.totalTime, 0, 1);
+  const color = urgencyColor(ratio);
+  const urgent = ratio <= 0.25;
+  const glow = urgent ? 0.72 + Math.sin(now * 0.012) * 0.28 : 1;
+
+  fillRound(x + 3, y + 4, w, h, 12, 'rgba(74, 44, 23, 0.14)');
+  fillRound(x, y, w, h, 12, '#fffaf0', color, urgent ? 4 : 2.5);
+
+  ctx.save();
+  ctx.globalAlpha = glow;
+  fillRound(x, y, w, 5, 3, color);
+  ctx.restore();
+
+  label(order.customer, x + 10, y + 20, 13, COLORS.ink, 'left', '800');
+  label(formatClock(order.timeLeft), x + w - 10, y + 20, 12, color, 'right', '800');
+
+  ctx.fillStyle = 'rgba(139, 94, 52, 0.14)';
+  ctx.fillRect(x + 10, y + 25, w - 20, 5);
+  ctx.fillStyle = color;
+  ctx.fillRect(x + 10, y + 25, (w - 20) * ratio, 5);
+
+  label(order.recipeName, x + 10, y + 46, 14, COLORS.ink, 'left', '800');
+  label(`$${order.price}`, x + w - 10, y + 46, 11, COLORS.inkSoft, 'right', '700');
+
+  const step = (w - 22) / order.ingredients.length;
+  const checked = order.checked || new Set();
+  for (let index = 0; index < order.ingredients.length; index += 1) {
+    const id = order.ingredients[index];
+    const chipX = x + 11 + index * step;
+    const chipY = y + 61;
+    const filled = checked.has(id);
+    ctx.fillStyle = filled ? '#e2f3dc' : '#f1e7d4';
+    ctx.strokeStyle = filled ? '#4f8b5f' : '#c8b492';
+    ctx.lineWidth = 1.6;
+    ctx.beginPath();
+    ctx.arc(chipX + 5, chipY - 2, 5.4, 0, Math.PI * 2);
+    ctx.fill();
+    ctx.stroke();
+    if (filled) drawCheckMark(chipX + 5, chipY - 2, 4.8, '#3f7a4f');
+    label(ingredientName(id), chipX + 13, chipY + 2, order.ingredients.length > 3 ? 9 : 10, filled ? '#3f6b4a' : '#8a7456', 'left', '700');
+  }
+}
+
+function drawEmptyTicket(x, y, w, h) {
+  ctx.setLineDash([7, 6]);
+  fillRound(x, y, w, h, 12, 'rgba(255, 250, 238, 0.38)', '#c9a46b', 2.5);
+  ctx.setLineDash([]);
+  label('Menunggu pesanan...', x + w / 2, y + h / 2 + 5, 12, '#a9865c', 'center', '700');
+}
+
+function drawHud(now) {
+  const x = 852;
+  const y = 10;
+  const w = 412;
+  const h = 72;
+  fillRound(x, y, w, h, 12, 'rgba(255, 250, 238, 0.84)', '#c9a46b', 2.5);
+
+  const coinX = x + 24;
+  const coinY = y + 22;
+  ctx.fillStyle = '#f2c64b';
+  ctx.strokeStyle = '#c99a2c';
+  ctx.lineWidth = 2;
+  ctx.beginPath();
+  ctx.arc(coinX, coinY, 12, 0, Math.PI * 2);
+  ctx.fill();
+  ctx.stroke();
+  label('$', coinX, coinY + 5, 15, '#8a5a12', 'center', '800');
+
+  label(`$${game.coins}`, x + 44, y + 30, 22, COLORS.ink, 'left', '800');
+  label(`/ $${game.target}`, x + 148, y + 29, 12, COLORS.inkSoft, 'left', '700');
+
+  ctx.fillStyle = 'rgba(139, 94, 52, 0.16)';
+  fillRound(x + 44, y + 37, 186, 7, 3.5, 'rgba(139, 94, 52, 0.16)');
+  const targetRatio = clamp(game.coins / game.target, 0, 1);
+  fillRound(x + 44, y + 37, 186 * targetRatio, 7, 3.5, targetRatio >= 1 ? '#4f8b5f' : COLORS.orange);
+
+  label(`Combo x${game.combo} · Streak ${game.streak}`, x + 44, y + 62, 11, COLORS.inkSoft, 'left', '700');
+
+  const shiftRatio = clamp(game.shiftTime / game.shiftLength, 0, 1);
+  const shiftColor = urgencyColor(shiftRatio);
+  label('SISA SHIFT', x + w - 14, y + 16, 9, COLORS.inkSoft, 'right', '800');
+  label(formatClock(game.shiftTime), x + w - 14, y + 39, 24, shiftColor, 'right', '800');
+
+  const next = orderBoard.next();
+  const nextText = next ? next.recipeName : 'Tidak ada';
+  label(`NEXT: ${nextText}`, x + w - 14, y + 62, 11, COLORS.inkSoft, 'right', '700');
+}
+
+function drawOrderBoard(now = performance.now()) {
   ctx.fillStyle = COLORS.creamDeep;
   ctx.fillRect(0, 0, WIDTH, 92);
 
   ctx.fillStyle = 'rgba(139, 94, 52, 0.08)';
   for (let y = 18; y < 84; y += 22) ctx.fillRect(0, y, WIDTH, 2);
 
-  label('PAPAN PESANAN', 26, 42, 28, COLORS.ink, 'left', '800');
-  label('Pesanan pelanggan akan tampil di sini', 27, 66, 14, COLORS.inkSoft, 'left', '600');
+  label('PAPAN PESANAN', 20, 33, 18, COLORS.ink, 'left', '800');
+  label('Pesanan pelanggan', 20, 51, 11, COLORS.inkSoft, 'left', '600');
+  label(`Tiket aktif ${orderBoard.orders.length}/${ORDER_LIMIT}`, 20, 70, 11, COLORS.inkSoft, 'left', '700');
 
-  fillRound(408, 14, 464, 64, 14, 'rgba(255, 250, 238, 0.6)', '#c9a46b', 3);
-  ctx.setLineDash([9, 7]);
-  roundPath(408, 14, 464, 64, 14);
-  ctx.strokeStyle = '#c9a46b';
-  ctx.lineWidth = 3;
-  ctx.stroke();
-  ctx.setLineDash([]);
-  label('Belum ada pesanan', 640, 52, 20, '#a9865c', 'center', '700');
+  const startX = 196;
+  const ticketW = 210;
+  const gap = 8;
+  for (let index = 0; index < ORDER_LIMIT; index += 1) {
+    const x = startX + index * (ticketW + gap);
+    const order = orderBoard.orders[index];
+    if (order) drawTicket(order, x, 10, ticketW, 72, now);
+    else drawEmptyTicket(x, 10, ticketW, 72);
+  }
 
-  drawStationIcon('plating', 1118, 45, 34);
-  label(`Sajian: ${game.served}`, 1254, 56, 24, COLORS.ink, 'right', '800');
+  drawHud(now);
 }
 
 function drawStationBody(station) {
@@ -637,18 +793,102 @@ function drawStationBody(station) {
   ctx.fill();
 }
 
+function drawPlateContents(items, cx, cy, width, size) {
+  ctx.fillStyle = '#fffdf7';
+  ctx.strokeStyle = '#c7a477';
+  ctx.lineWidth = 3;
+  ctx.beginPath();
+  ctx.ellipse(cx, cy, width / 2, width * 0.2, 0, 0, Math.PI * 2);
+  ctx.fill();
+  ctx.stroke();
+
+  ctx.strokeStyle = 'rgba(199, 164, 119, 0.55)';
+  ctx.lineWidth = 2;
+  ctx.beginPath();
+  ctx.ellipse(cx, cy, width * 0.36, width * 0.13, 0, 0, Math.PI * 2);
+  ctx.stroke();
+
+  if (!items.length) return;
+
+  const usable = width * 0.66;
+  const spacing = items.length > 1 ? usable / (items.length - 1) : 0;
+  const startX = cx - usable / 2;
+  for (let index = 0; index < items.length; index += 1) {
+    drawIngredient(itemId(items[index]), startX + index * spacing, cy - 2, size);
+  }
+}
+
+function drawStationProgress(station) {
+  fillRound(station.x + 18, station.y + station.h - 13, station.w - 36, 7, 3.5, 'rgba(58, 33, 16, 0.24)');
+  fillRound(
+    station.x + 18,
+    station.y + station.h - 13,
+    (station.w - 36) * clamp(station.progress, 0, 1),
+    7,
+    3.5,
+    '#ffe08a',
+  );
+}
+
+function drawPlatingStation(station) {
+  const cx = station.x + station.w / 2;
+  label('PLATING', cx, station.y + 28, 26, station.ink, 'center', '800');
+  label('Tata Sajian', cx, station.y + 46, 12, station.ink, 'center', '600');
+
+  const status = kitchen.plateStatus();
+  drawPlateContents(kitchen.plate, cx, station.y + 84, 250, 40);
+
+  if (!kitchen.plate.length) {
+    label('Piring kosong', cx, station.y + 90, 13, 'rgba(74, 44, 23, 0.48)', 'center', '700');
+    label('Taruh bahan siap di sini', cx, station.y + 123, 12, 'rgba(74, 44, 23, 0.45)', 'center', '600');
+    return;
+  }
+
+  const total = status.candidate ? status.candidate.ingredients.length : kitchen.plate.length;
+  const count = kitchen.plate.length;
+  if (status.complete) {
+    label(`${status.complete.name} siap diambil (E)`, cx, station.y + 124, 13, '#3f7a4f', 'center', '800');
+  } else if (status.candidate) {
+    label(`Rakitan ${count}/${total} · ${status.candidate.name}`, cx, station.y + 124, 13, COLORS.ink, 'center', '800');
+  } else {
+    label(`Rakitan ${count} bahan tidak cocok`, cx, station.y + 124, 12, '#b04a3a', 'center', '800');
+  }
+
+  fillRound(station.x + 34, station.y + 133, station.w - 68, 8, 4, 'rgba(58, 33, 16, 0.2)');
+  fillRound(
+    station.x + 34,
+    station.y + 133,
+    (station.w - 68) * (total > 0 ? count / total : 0),
+    8,
+    4,
+    status.complete ? '#4f8b5f' : COLORS.orange,
+  );
+}
+
 function drawStation(station) {
   drawStationBody(station);
 
-  const cx = station.x + station.w / 2;
-  const iconY = station.y + (station.kind === 'plating' ? 38 : 32);
-  const labelY = station.y + (station.kind === 'plating' ? 92 : 76);
-  const subY = station.y + (station.kind === 'plating' ? 114 : 96);
-  const labelSize = station.kind === 'plating' ? 32 : 30;
+  if (station.kind === 'plating') {
+    drawPlatingStation(station);
+    return;
+  }
 
-  drawStationIcon(station.kind, cx, iconY, station.kind === 'plating' ? 38 : 32);
-  label(station.label, cx, labelY, labelSize, station.ink, 'center', '800');
-  label(station.sub, cx, subY, 14, station.ink, 'center', '600');
+  const cx = station.x + station.w / 2;
+  const iconY = station.y + 32;
+  const labelY = station.y + 76;
+  const subY = station.y + 96;
+
+  drawStationIcon(station.kind, cx, iconY, 32);
+  label(station.label, cx, labelY, 30, station.ink, 'center', '800');
+
+  let subText = station.sub;
+  if (station.working) {
+    const action = station.kind === 'chop' ? 'Memotong' : 'Memasak';
+    subText = `${action} ${Math.round(clamp(station.progress, 0, 1) * 100)}%`;
+  } else if (station.item) {
+    subText = itemCaption(station.item);
+  }
+  label(subText, cx, subY, 14, station.ink, 'center', '600');
 
   if (station.item) {
     const badgeX = station.x + station.w - 28;
@@ -660,8 +900,21 @@ function drawStation(station) {
     ctx.arc(badgeX, badgeY, 21, 0, Math.PI * 2);
     ctx.fill();
     ctx.stroke();
-    drawIngredient(station.item, badgeX, badgeY, 28);
+    drawIngredient(itemId(station.item), badgeX, badgeY, 28);
+
+    if (itemReady(station.item)) {
+      ctx.fillStyle = '#4f8b5f';
+      ctx.strokeStyle = '#fffdf7';
+      ctx.lineWidth = 2;
+      ctx.beginPath();
+      ctx.arc(badgeX + 16, badgeY - 15, 9, 0, Math.PI * 2);
+      ctx.fill();
+      ctx.stroke();
+      drawCheckMark(badgeX + 16, badgeY - 15, 7, '#fffdf7');
+    }
   }
+
+  if (station.working) drawStationProgress(station);
 }
 
 function drawPantry(station) {
@@ -707,7 +960,7 @@ function drawServeLane(station) {
 }
 
 function drawKitchen(now) {
-  drawOrderBoard();
+  drawOrderBoard(now);
   drawFloor();
 
   for (const station of STATIONS) {
@@ -881,13 +1134,27 @@ function drawKiko(now) {
 
   ctx.restore();
 
-  if (game.carried) {
+  if (kitchen.carried) {
     const itemY = kiko.y - 104 + bob;
-    ctx.fillStyle = 'rgba(255, 253, 247, 0.78)';
-    ctx.beginPath();
-    ctx.arc(kiko.x, itemY, 24, 0, Math.PI * 2);
-    ctx.fill();
-    drawIngredient(game.carried, kiko.x, itemY, 36);
+    if (kitchen.carried.kind === 'dish') {
+      drawPlateContents(kitchen.carried.ingredients, kiko.x, itemY, 76, 24);
+    } else {
+      ctx.fillStyle = 'rgba(255, 253, 247, 0.78)';
+      ctx.beginPath();
+      ctx.arc(kiko.x, itemY, 24, 0, Math.PI * 2);
+      ctx.fill();
+      drawIngredient(itemId(kitchen.carried), kiko.x, itemY, 36);
+      if (itemReady(kitchen.carried)) {
+        ctx.fillStyle = '#4f8b5f';
+        ctx.strokeStyle = '#fffdf7';
+        ctx.lineWidth = 2;
+        ctx.beginPath();
+        ctx.arc(kiko.x + 18, itemY - 17, 8, 0, Math.PI * 2);
+        ctx.fill();
+        ctx.stroke();
+        drawCheckMark(kiko.x + 18, itemY - 17, 6, '#fffdf7');
+      }
+    }
   }
 }
 
@@ -931,23 +1198,47 @@ function promptForInteraction() {
   if (game.screen !== SCREEN.PLAY) return null;
 
   if (distanceToServe() < 8) {
-    return game.carried ? 'Spasi - Sajikan' : 'Jalur SERVE PASS';
+    if (!kitchen.carried) return 'Jalur SERVE PASS';
+    if (kitchen.carried.kind === 'dish') return `Spasi - Sajikan ${kitchen.carried.name}`;
+    return 'Sajian belum lengkap';
   }
 
   const hit = nearestInteraction();
   if (!hit) return null;
 
   if (hit.type === 'ingredient') {
-    return game.carried ? 'Tangan Kiko penuh' : `E - Ambil ${hit.ingredient.name}`;
+    return kitchen.carried ? 'Tangan Kiko penuh' : `E - Ambil ${hit.ingredient.name}`;
   }
 
   if (hit.type === 'bin') {
-    return game.carried ? 'E - Buang ke BIN' : 'BIN kosong';
+    if (kitchen.carried) return `E - Buang ${kitchen.carried.kind === 'dish' ? 'piring' : ingredientName(kitchen.carried.id)} ke BIN`;
+    if (kitchen.plate.length) return 'E - Kosongkan piring';
+    return 'BIN kosong';
   }
 
   const station = hit.station;
-  if (game.carried) return `E - Taruh di ${station.label}`;
-  if (station.item) return `E - Ambil ${ingredientName(station.item)}`;
+  if (station.kind === 'plating') {
+    if (kitchen.carried && kitchen.carried.kind === 'dish') return 'Piring lengkap di tangan';
+    if (kitchen.carried) {
+      if (!itemReady(kitchen.carried)) return `${ingredientName(kitchen.carried.id)} belum siap`;
+      return `E - Tata ${ingredientName(kitchen.carried.id)} di piring`;
+    }
+    const recipe = kitchen.plateRecipe();
+    if (recipe) return `E - Ambil piring ${recipe.name}`;
+    if (kitchen.plate.length) {
+      const status = kitchen.plateStatus();
+      const total = status.candidate ? status.candidate.ingredients.length : kitchen.plate.length;
+      return `Rakitan ${kitchen.plate.length}/${total}${status.candidate ? ` · ${status.candidate.name}` : ''}`;
+    }
+    return 'PLATING kosong';
+  }
+
+  if (kitchen.carried && kitchen.carried.kind === 'dish') return 'Simpan piring dulu';
+  if (kitchen.carried) return `E - Taruh ${ingredientName(kitchen.carried.id)} di ${station.label}`;
+  if (station.item) {
+    if (station.working) return `Sedang ${station.kind === 'chop' ? 'memotong' : 'memasak'}...`;
+    return `E - Ambil ${itemCaption(station.item)}`;
+  }
   return `${station.label} kosong`;
 }
 
@@ -1024,8 +1315,10 @@ function drawScreens(now) {
       [
         'Bantu Kiko si kucing koki memasak di dapur!',
         'Jalan dengan WASD atau panah, atau klik lantai.',
-        'Ambil dan taruh bahan dengan E, sajikan dengan Spasi.',
-        'Tekan P untuk jeda saat bermain.',
+        'Ambil bahan di PANTRY dengan E, potong di CHOP, masak di STOVE.',
+        'Tata bahan matang di PLATING sampai jadi sajian lengkap.',
+        'Antar piring ke SERVE PASS lalu tekan Spasi untuk menyajikan.',
+        `Capai target $${game.target} sebelum shift ${formatClock(game.shiftLength)} habis!`,
       ],
       'Tekan Spasi atau klik untuk mulai',
       true,
@@ -1033,11 +1326,16 @@ function drawScreens(now) {
   } else if (game.screen === SCREEN.PAUSE) {
     drawOverlayPanel(540, 270, 'Jeda', ['Dapur menunggu Kiko.'], 'Tekan P untuk lanjut', false);
   } else if (game.screen === SCREEN.END) {
+    const targetMet = game.coins >= game.target;
     drawOverlayPanel(
-      660,
-      330,
-      'Selesai!',
-      [`Sajian diantar: ${game.served}`, 'Terima kasih sudah memasak bersama Kiko.'],
+      680,
+      340,
+      'Shift Selesai!',
+      [
+        `Koin shift ini: $${game.coins} / target $${game.target}`,
+        `Sajian diantar: ${game.served} · Streak terakhir: ${game.streak}`,
+        targetMet ? 'Target tercapai! Dapur Ceria bangga pada Kiko.' : 'Belum mencapai target. Ayo coba lagi!',
+      ],
       'Tekan Spasi atau klik untuk main lagi',
       true,
     );
@@ -1069,7 +1367,10 @@ function showMessage(message) {
 function resetGame() {
   game.elapsed = 0;
   game.served = 0;
-  game.carried = null;
+  game.coins = 0;
+  game.combo = 1;
+  game.streak = 0;
+  game.shiftTime = SHIFT_LENGTH;
   game.message = '';
   game.messageTimer = 0;
   game.kiko.x = 760;
@@ -1077,18 +1378,15 @@ function resetGame() {
   game.kiko.facingLeft = false;
   game.kiko.moving = false;
   moveTarget = null;
-  for (const station of STATIONS) {
-    if (station.kind === 'chop' || station.kind === 'stove' || station.kind === 'plating') {
-      station.item = null;
-    }
-  }
+  kitchen.reset();
+  orderBoard.reset();
 }
 
 function startGame() {
   resetGame();
   game.screen = SCREEN.PLAY;
-  game.message = 'Bantu Kiko memasak, ya!';
-  game.messageTimer = 2.6;
+  game.message = 'Ambil bahan, masak, tata di piring, lalu sajikan!';
+  game.messageTimer = 3.2;
   announce('Bermain. Bantu Kiko memasak.');
 }
 
@@ -1106,7 +1404,10 @@ function resumeGame() {
 
 function endGame() {
   game.screen = SCREEN.END;
-  announce(`Selesai. Sajian diantar ${game.served}.`);
+  const targetMet = game.coins >= game.target;
+  announce(
+    `Selesai. Koin $${game.coins} dari target $${game.target}. Sajian ${game.served}. ${targetMet ? 'Target tercapai!' : 'Target belum tercapai.'}`,
+  );
 }
 
 function togglePause() {
@@ -1188,6 +1489,11 @@ function moveKiko(dt) {
 function interact() {
   if (game.screen !== SCREEN.PLAY) return;
 
+  if (distanceToServe() < 8) {
+    showMessage('Tekan Spasi untuk menyajikan ke tiket yang cocok.');
+    return;
+  }
+
   const hit = nearestInteraction();
   if (!hit) {
     showMessage('Tidak ada yang bisa diambil di sini.');
@@ -1195,41 +1501,43 @@ function interact() {
   }
 
   if (hit.type === 'ingredient') {
-    if (game.carried) {
-      showMessage('Tangan Kiko sudah penuh. Taruh dulu, ya.');
-      return;
-    }
-    game.carried = hit.ingredient.id;
-    showMessage(`Kiko mengambil ${hit.ingredient.name}.`);
+    const result = kitchen.takeIngredient(hit.ingredient.id);
+    showMessage(result.message);
     return;
   }
 
   if (hit.type === 'bin') {
-    if (game.carried) {
-      showMessage(`${ingredientName(game.carried)} dibuang ke BIN.`);
-      game.carried = null;
-    } else {
-      showMessage('BIN masih kosong.');
+    if (kitchen.carried) {
+      showMessage(kitchen.discardCarried().message);
+      return;
     }
+    if (kitchen.plate.length) {
+      showMessage(kitchen.clearPlate().message);
+      return;
+    }
+    showMessage('BIN masih kosong.');
     return;
   }
 
   const station = hit.station;
-  if (game.carried) {
-    if (station.item) {
-      showMessage(`${station.label} sudah terisi.`);
+  if (station.kind === 'plating') {
+    if (kitchen.carried && kitchen.carried.kind === 'dish') {
+      showMessage('Piring lengkap sudah di tangan Kiko. Antar ke SERVE PASS.');
       return;
     }
-    station.item = game.carried;
-    showMessage(`${ingredientName(game.carried)} ditaruh di ${station.label}.`);
-    game.carried = null;
+    const result = kitchen.carried ? kitchen.addToPlate() : kitchen.pickupPlate();
+    showMessage(result.message);
+    return;
+  }
+
+  if (kitchen.carried) {
+    const result = station.kind === 'chop' ? kitchen.placeAtChop(station) : kitchen.placeAtStove(station);
+    showMessage(result.message);
     return;
   }
 
   if (station.item) {
-    game.carried = station.item;
-    station.item = null;
-    showMessage(`Kiko mengambil ${ingredientName(game.carried)} dari ${station.label}.`);
+    showMessage(kitchen.takeFromStation(station).message);
     return;
   }
 
@@ -1237,19 +1545,40 @@ function interact() {
 }
 
 function serve() {
+  if (game.screen !== SCREEN.PLAY) return;
+
   if (distanceToServe() > 8) {
     showMessage('Dekati jalur SERVE PASS untuk menyajikan.');
     return;
   }
 
-  if (!game.carried) {
+  const dish = kitchen.carried;
+  if (!dish) {
     showMessage('Kiko belum membawa sajian.');
     return;
   }
 
+  if (dish.kind !== 'dish') {
+    showMessage('Bahan belum jadi sajian. Tata dulu di PLATING.');
+    return;
+  }
+
+  const order = orderBoard.serve(dish.recipeId);
+  if (!order) {
+    showMessage(`Belum ada tiket ${dish.name}. Cek papan pesanan.`);
+    return;
+  }
+
+  const multiplier = game.combo;
+  const pay = dish.price * multiplier;
+  game.coins += pay;
   game.served += 1;
-  showMessage(`Sajian diantar! Total sajian: ${game.served}.`);
-  game.carried = null;
+  game.streak += 1;
+  game.combo = Math.min(MAX_COMBO, game.combo + 1);
+  kitchen.carried = null;
+
+  const targetText = game.coins >= game.target ? ' Target tercapai!' : '';
+  showMessage(`${dish.name} untuk ${order.customer}! +$${pay} (x${multiplier}).${targetText}`);
 }
 
 function primaryAction() {
@@ -1266,7 +1595,22 @@ function update(dt) {
   if (game.screen !== SCREEN.PLAY) return;
 
   game.elapsed += dt;
+  game.shiftTime = Math.max(0, game.shiftTime - dt);
+  kitchen.update(dt);
+  for (const event of kitchen.drainEvents()) showMessage(event.message);
+
+  orderBoard.update(dt, kitchen);
+  for (const event of orderBoard.drainEvents()) {
+    if (event.type === 'expired') {
+      game.combo = COMBO_BREAK;
+      game.streak = 0;
+      showMessage(`Tiket ${event.order.customer} hangus! Combo kembali x${COMBO_BREAK}.`);
+    }
+  }
+
   moveKiko(dt);
+
+  if (game.shiftTime <= 0) endGame();
 }
 
 function frame(now) {
@@ -1349,12 +1693,21 @@ function setKiko(x, y) {
   if (Number.isFinite(y)) game.kiko.y = clamp(y, PLAY.top + game.kiko.r, PLAY.bottom - game.kiko.r);
 }
 
-function setCarried(id) {
-  game.carried = id && INGREDIENT_BY_ID.has(id) ? id : null;
+function setCarried(value) {
+  if (typeof value === 'string') kitchen.setCarried(INGREDIENT_BY_ID.has(value) ? value : null);
+  else kitchen.setCarried(value ?? null);
 }
 
 function setServed(value) {
   game.served = Number.isFinite(value) ? Math.max(0, Math.floor(value)) : 0;
+}
+
+function setCoins(value) {
+  game.coins = Number.isFinite(value) ? Math.max(0, Math.floor(value)) : 0;
+}
+
+function setShift(value) {
+  game.shiftTime = Number.isFinite(value) ? clamp(value, 0, game.shiftLength) : game.shiftLength;
 }
 
 function stageShot(name) {
@@ -1363,17 +1716,39 @@ function stageShot(name) {
   if (name === 'play') {
     game.screen = SCREEN.PLAY;
     game.kiko.x = 760;
-    game.kiko.y = 370;
-    game.carried = 'keju';
+    game.kiko.y = 500;
     game.served = 3;
+    game.coins = 74;
+    game.combo = 3;
+    game.streak = 3;
+    game.shiftTime = 126;
+    orderBoard.stage(['sandwich', 'omelet', 'burger'], [14, 38, 61], [58, 62, 72]);
+    kitchen.plate = [makeItem('roti'), makeItem('keju')];
+    kitchen.carried = makeItem('selada');
+    kitchen.carried.chopped = true;
     const chop = STATIONS.find((station) => station.id === 'chop1');
     const stove = STATIONS.find((station) => station.id === 'stove1');
-    if (chop) chop.item = 'tomat';
-    if (stove) stove.item = 'daging';
+    if (chop) {
+      chop.item = makeItem('tomat');
+      chop.progress = 0.58;
+      chop.working = true;
+    }
+    if (stove) {
+      stove.item = makeItem('daging');
+      stove.item.chopped = true;
+      stove.progress = 0.64;
+      stove.working = true;
+    }
+    orderBoard.update(0, kitchen);
     showMessage('Kiko siap memasak!');
   } else if (name === 'end') {
     game.screen = SCREEN.END;
     game.served = 7;
+    game.coins = 146;
+    game.combo = 4;
+    game.streak = 6;
+    game.shiftTime = 0;
+    orderBoard.stage([]);
     game.kiko.x = 900;
     game.kiko.y = 400;
   } else {
@@ -1391,7 +1766,12 @@ window.__kiko = {
   status: game,
   screenNames: SCREEN,
   ingredients: INGREDIENTS,
+  recipes: RECIPES,
+  customers: CUSTOMERS,
   stations: STATIONS,
+  pantrySlots: PANTRY_SLOTS,
+  kitchen,
+  orders: orderBoard,
   width: WIDTH,
   height: HEIGHT,
   start: startGame,
@@ -1403,12 +1783,14 @@ window.__kiko = {
   setKiko,
   setCarried,
   setServed,
+  setCoins,
+  setShift,
   stage: stageShot,
   message: showMessage,
   render,
 };
 
-const shot = new URLSearchParams(window.location.search).get('shot');
+const shot = params.get('shot');
 window.__shotReady = false;
 
 if (shot) stageShot(shot);
