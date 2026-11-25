@@ -96,8 +96,8 @@ export class Kitchen {
     return { ok: false, message };
   }
 
-  emit(message) {
-    this.events.push({ message });
+  emit(message, type = 'info') {
+    this.events.push({ message, type });
   }
 
   drainEvents() {
